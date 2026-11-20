@@ -1,0 +1,15 @@
+defaults:
+  - fastwam_wan5b_dino_s_aux_mot_short_qwen3vl_hist4
+  - _self_
+
+# Auxiliary target only; retain the VAE/DINO/action MoT and CAIR adapter.
+dino_future_mode: predict
+geometry_config:
+  enabled: true
+  decoder_type: spatial_conv2d
+  decoder_dim: 256
+  num_layers: 2
+  output_channels: 1
+  output_activation: identity
+loss:
+  lambda_geometry: 0.05

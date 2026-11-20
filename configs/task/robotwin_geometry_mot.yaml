@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - robotwin_wan5b_dino_s_aux_mot_short_qwen3vl_hist4_3cam_384x320_1e-4
+  - override /model: fastwam_geometry_mot
+  - _self_
+
+batch_size: 1
+gradient_accumulation_steps: 16
+data:
+  train:
+    geometry_enabled: true
+    geometry_cache_dir: ./data/geometry_cache/robotwin/train
+    geometry_cache_required: true
+    geometry_cache_mode: window
+    geometry_size: [96, 80]
+    geometry_normalize: unit
+    geometry_min_depth: 0.0
+    geometry_max_depth: 10.0

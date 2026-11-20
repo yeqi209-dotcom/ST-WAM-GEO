@@ -1,0 +1,18 @@
+defaults:
+  - fastwam_wan5b_dino_s_aux_mot_short_qwen3vl_hist4
+  - _self_
+
+# Independent fourth expert; normalized depth is a training target, not a
+# policy observation. The existing VAE/DINO/action/CAIR settings are retained.
+dino_future_mode: predict
+geometry_config:
+  enabled: true
+  mode: expert
+  hidden_dim: 256
+  ffn_dim: 1024
+  freq_dim: 256
+  eps: 1.0e-6
+  patch_size: [1, 4, 4]
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+loss:
+  lambda_geometry: 0.05
