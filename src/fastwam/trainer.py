@@ -49,7 +49,7 @@ class Wan22Trainer:
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.safe_checkpoint_serialization = bool(getattr(cfg, "safe_checkpoint_serialization", False))
-        self.save_accelerate_state = bool(getattr(cfg, "save_accelerate_state", True))
+        self.save_accelerate_state = bool(getattr(cfg, "save_accelerate_state", False))
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
@@ -137,7 +137,8 @@ class Wan22Trainer:
         ensure_dir(self.output_dir)
         ensure_dir(self.checkpoint_root)
         ensure_dir(self.weights_dir)
-        ensure_dir(self.state_dir)
+        if self.save_accelerate_state:
+            ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
 
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
@@ -1132,17 +1133,19 @@ class Wan22Trainer:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
         self.accelerator.wait_for_everyone()
 
-        state_path = os.path.join(self.state_dir, step_tag)
-        ensure_dir(state_path)
+        state_path = None
         if self.save_accelerate_state:
+            state_path = os.path.join(self.state_dir, step_tag)
+            ensure_dir(state_path)
             self.accelerator.save_state(output_dir=state_path)
+            if self.accelerator.is_main_process:
+                self._save_trainer_state(state_path, full_state=True)
         elif self.accelerator.is_main_process:
-            logger.warning(
-                "Skipping Accelerate/DeepSpeed state save at step=%d; only the verified weight checkpoint is resumable.",
+            logger.info(
+                "Saved weights only at step=%d; no training state was written. "
+                "Restart from weights with a new optimizer, scheduler and step count.",
                 self.global_step,
             )
-        if self.accelerator.is_main_process:
-            self._save_trainer_state(state_path, full_state=self.save_accelerate_state)
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}

@@ -4,6 +4,13 @@
 [GEOMETRY_MOT_README.md](GEOMETRY_MOT_README.md)。新任务为 `libero_geometry_mot`
 和 `robotwin_geometry_mot`；以下保留上游安装、权重与 baseline 说明。
 
+训练默认只保存 `checkpoints/weights/step_xxxxxx.pt`（`save_accelerate_state=false`），
+不生成 DeepSpeed/Accelerate state。可用 `resume=/path/to/weights/step_xxxxxx.pt`
+加载权重继续训练，但 optimizer、学习率调度、step 和数据进度会重新开始；请使用新的
+`output_dir`，并将 `max_steps` 设为本次还要训练的步数。已有启动命令中的
+`save_accelerate_state=true` 需要改为 `false`。详见
+[8×B200 部署手册](DEPLOY_8xB200.md) 和 [LIBERO 训练手册](configs/TRAIN_LIBERO_8xB200.md)。
+
 [![arXiv](https://img.shields.io/badge/arXiv-2607.28993-b31b1b.svg)](https://arxiv.org/abs/2607.28993)
 [![Project Page](https://img.shields.io/badge/Project-Page-2ea44f.svg)](https://thu-wangmx.github.io/st-wam/)
 [![ModelScope](https://img.shields.io/badge/ModelScope-Checkpoints-624aff.svg)](https://modelscope.cn/models/THU4Spiderman/Semantic_Temporal_World_Action_Model)

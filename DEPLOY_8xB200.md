@@ -1,6 +1,6 @@
 # ST-WAM-GEO：单机 8×B200 部署与下载手册
 
-编写日期：2026-11-19。依据本目录的实际源码、Hydra 配置及下载仓库文件元数据核对。
+编写日期：2026-11-19；checkpoint 保存策略更新：2026-11-23。依据本目录的实际源码、Hydra 配置及下载仓库文件元数据核对。
 
 本文交给服务器上的合作者 / agent 执行。**主流程以 LIBERO 四个 suite 的训练为目标**，RoboTwin 的差异在末尾单列。本文中的服务器根目录 `/data/stwam-geo` 是示例，执行前改为容量充足的本地 NVMe 路径；所有命令使用 **Linux Bash**。
 
@@ -20,7 +20,7 @@
 | 6 | 生成 ActionDiT、DinoVideoDiT 初始化文件 | 两个 `.pt` 有效，参数形状匹配 |
 | 7 | 生成文本、VAE、DINO 缓存 | VAE 为 window_mmap；DINO 为 frame_mmap，支持历史读取 |
 | 8 | 准备对齐深度并打包 geometry cache | 每个训练 sample 都有窗口，索引/相机/尺度正确 |
-| 9 | 数据检查、小模型测试、单卡及 8 卡短跑 | 四项 loss 有限，完成反向与 optimizer step，checkpoint 可保存和恢复 |
+| 9 | 数据检查、小模型测试、单卡及 8 卡短跑 | 四项 loss 有限，完成反向与 optimizer step，权重 checkpoint 可保存并重新加载训练 |
 | 10 | 正式训练 | 记录实际显存、吞吐、配置、数据与权重版本，并监控磁盘 |
 | 11 | 可选：安装 LIBERO 仿真器并评测 | 动作成功率评测独立于训练集 loss |
 
@@ -28,9 +28,9 @@
 
 ## 2. 硬件、磁盘与下载预算
 
-建议 Linux Ubuntu 22.04/24.04 x86_64、8×B200（具体单卡容量以 `nvidia-smi` 为准）、至少 256 GB 主机内存，推荐 512 GB 或更多；32–64 个可用 CPU 核，本地 NVMe。多进程加载基础权重和保存 DeepSpeed state 会产生较高的主机内存峰值。
+建议 Linux Ubuntu 22.04/24.04 x86_64、8×B200（具体单卡容量以 `nvidia-smi` 为准）、至少 256 GB 主机内存，推荐 512 GB 或更多；32–64 个可用 CPU 核，本地 NVMe。多进程加载基础权重和保存模型权重会产生较高的主机内存峰值。当前默认不保存 DeepSpeed/Accelerate state。
 
-**LIBERO 建议先分配 2 TB 可用 NVMe**。若长期保存全部训练 state，或运行多个实验，应分配更多；下面的缓存预算不能代替 checkpoint 预算。环境、临时文件、原始下载、缓存和实验输出均需落到大盘。
+**LIBERO 建议先分配 2 TB 可用 NVMe**。若长期保存全部权重 checkpoint，或运行多个实验，应分配更多；下面的缓存预算不能代替 checkpoint 预算。环境、临时文件、原始下载、缓存和实验输出均需落到大盘。
 
 本节 GB = 10^9 bytes，GiB = 2^30 bytes。下载数据、缓存和模型权重是不同项目，不要重复计算共享文件。
 
@@ -73,17 +73,17 @@
 | Geometry 窗口，float32 | N × 9 × 56 × 112 × 4 | **62.71**，另有小文件开销 |
 | 可选有效性 mask | bank: N×56×112；windows: N×9×56×112 | 约 **1.74 + 15.68** |
 | 模型权重 checkpoint | 四专家 + CAIR adapter / proprio，不含冻结 Qwen 主体 | 约 15–20 / 份，待实测 |
-| 完整 DeepSpeed/Accelerate state | 参数、optimizer 分片、其他模块/训练状态 | **先按 100–300 / 份预留，待首次保存实测** |
+| 完整 DeepSpeed/Accelerate state | 默认 `save_accelerate_state=false`，不生成 | **0（默认不保存）** |
 
 Geometry 每 sample 一个文件，可能产生几十万个小文件；检查 inode。VAE 9 个采样 RGB 帧经时间压缩后是 3 个 latent 帧，不应按 9 帧 latent 估计。DINO 缓存按逐帧保存，未来窗口与 CAIR 历史共享该库，不额外缓存每个 9 帧 DINO 窗口。
 
-默认 LIBERO 为 10 epochs、每 2000 optimizer steps 保存一次，代码**没有自动保留最近 K 份 checkpoint 的清理策略**。按示例 N、global batch=128，约 2.17 万 steps；保留全部 state 可能占数 TB。正式运行应记录首份 state 的实际大小，再制定归档/保留策略；不要静默删除已有实验。
+默认 LIBERO 为 10 epochs、每 2000 optimizer steps 保存一次权重，训练结束也会保存，代码**没有自动保留最近 K 份 checkpoint 的清理策略**。按示例 N、global batch=128，约 2.17 万 steps，共约 11 份权重；按每份 15–20 GB 估算约 165–220 GB，最终以实测为准。默认不生成 `checkpoints/state/` 或 `trainer_state.json`。旧启动脚本若显式设置 `save_accelerate_state=true`，必须改为 `false`；已运行的训练进程不会因更新源码而自动改变配置。已有 state 不会自动删除。
 
 ### 2.3 显存与 batch 起点
 
 先使用 bf16、mixed-attention gradient checkpointing、ZeRO-1、每卡 microbatch=1、梯度累积=16：`8 × 1 × 16 = 128`。B200 的八卡显存并不会自动组成一个可任意使用的大显存池；ZeRO-1 主要分片 optimizer 状态，参数和梯度仍有复制。
 
-这个设置可先按 **单卡约 60–120 GB 的预算区间**规划，但这不是测量结果或上限。Attention kernel 对自定义 mask 的支持、初始化、验证视频生成和 state 保存会影响峰值；若回退到数学 attention，可能超过该范围。先实测，再试 `batch_size=2 gradient_accumulation_steps=8` 或 `4/4`，保持 global batch=128。不要因 B200 支持 FP8 就改成 FP8；本代码没有配置相应训练流程。
+这个设置可先按 **单卡约 60–120 GB 的预算区间**规划，但这不是测量结果或上限。Attention kernel 对自定义 mask 的支持、初始化、验证视频生成和权重保存会影响峰值；若回退到数学 attention，可能超过该范围。先实测，再试 `batch_size=2 gradient_accumulation_steps=8` 或 `4/4`，保持 global batch=128。不要因 B200 支持 FP8 就改成 FP8；本代码没有配置相应训练流程。
 
 ## 3. 代码、目录和系统准备
 
@@ -601,7 +601,7 @@ CUDA_VISIBLE_DEVICES=0 WAIT_FOR_GPUS=0 bash scripts/train_zero1.sh 1 \
 
 单卡 ZeRO-1 不分摊 optimizer 状态，显存可能比 8 卡起点更高；单卡 OOM 不能单独证明 8 卡不能训练。短跑关闭视频验证和完整 state 保存以隔离训练问题，但 trainer 结束时仍会保存权重，需预留磁盘。
 
-### 10.2 8 卡：验证通信、真实 batch 和完整 state
+### 10.2 8 卡：验证通信、真实 batch 和权重保存
 
 ```bash
 WAIT_FOR_GPUS=0 bash scripts/train_zero1.sh 8 \
@@ -609,7 +609,7 @@ WAIT_FOR_GPUS=0 bash scripts/train_zero1.sh 8 \
   "output_dir=$STWAM_ROOT/runs/libero_geo_8gpu_smoke" \
   max_steps=3 batch_size=1 gradient_accumulation_steps=16 num_workers=2 \
   log_every=1 save_every=0 eval_every=0 \
-  save_accelerate_state=true wandb.enabled=false \
+  save_accelerate_state=false wandb.enabled=false \
   2>&1 | tee "$STWAM_ROOT/logs/libero_geo_8gpu_smoke.log"
 ```
 
@@ -624,7 +624,7 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,memory.total,utilization.gpu 
 
 `nvidia-smi` 的采样值可能漏掉瞬时峰值；严谨测量应在训练进程中记录 `torch.cuda.max_memory_allocated()` 和 `max_memory_reserved()`。不要只以冻结模型参数大小推断训练显存。
 
-短跑成功后检查 `runs/libero_geo_8gpu_smoke/checkpoints/state/step_000003/` 和 `weights/step_000003.pt`。以**同样架构、同样 batch 和相同 8 卡数**设置 `resume=该state目录` 再跑到 `max_steps=4`，确认恢复。短跑 scheduler 已按短步数创建，恢复检查只验证机制；正式训练请使用新输出目录、`resume=null`。
+短跑成功后检查 `runs/libero_geo_8gpu_smoke/checkpoints/weights/step_000003.pt`，新输出目录下不应生成 `checkpoints/state/`。用同样模型配置，在新的输出目录设置 `resume=该权重文件`、`max_steps=1` 再运行，确认权重加载后能完成一个新的训练 step；日志应从 step 0 重新计数，并提示 optimizer / scheduler / step 未恢复。这只验证权重重新启动机制；正式训练请使用新输出目录、`resume=null`。
 
 正式启用视频验证前，另做一个短跑设置 `eval_every=1 eval_num_inference_steps=2` 测试验证路径及额外显存；该验证仍不是仿真动作成功率评测。
 
@@ -636,18 +636,18 @@ WAIT_FOR_GPUS=0 bash scripts/train_zero1.sh 8 \
   "output_dir=$STWAM_ROOT/runs/libero_geometry_mot_run01" \
   batch_size=1 gradient_accumulation_steps=16 num_workers=4 \
   num_epochs=10 max_steps=null learning_rate=1e-4 \
-  save_every=2000 eval_every=200 save_accelerate_state=true \
+  save_every=2000 eval_every=200 save_accelerate_state=false \
   mixed_precision=bf16 model.mot_checkpoint_mixed_attn=true \
   resume=null wandb.enabled=false \
   2>&1 | tee "$STWAM_ROOT/logs/libero_geometry_mot_run01.log"
 ```
 
-`num_workers=4` 表示每 rank 4 个，共 32 个。先观察数据读取是否成为瓶颈；缓存放在高延迟共享存储时，geometry 小文件尤其容易拖慢。显存不足时先保持 microbatch=1，检查 attention backend 和验证峰值，然后试项目已有 `train_zero2.sh`；更换 ZeRO stage 后重新检查完整 state 恢复，不直接复用不匹配的旧 state。
+`num_workers=4` 表示每 rank 4 个，共 32 个。先观察数据读取是否成为瓶颈；缓存放在高延迟共享存储时，geometry 小文件尤其容易拖慢。显存不足时先保持 microbatch=1，检查 attention backend 和验证峰值，然后试项目已有 `train_zero2.sh`；更换 ZeRO stage 后重新进行短跑，检查显存和权重加载。
 
 恢复规则：
 
-- `resume=/.../checkpoints/state/step_xxxxxx`：本版本、匹配架构的完整训练恢复，含 optimizer / scheduler / 进度。
-- `resume=/.../checkpoints/weights/step_xxxxxx.pt`：只加载权重，不等于完整续训。
+- `resume=/.../checkpoints/weights/step_xxxxxx.pt`：加载已训练权重继续训练；optimizer、scheduler（含 warmup）、step、epoch 和数据进度重新开始。使用新的 `output_dir` 和日志文件；`max_steps` 是本次新增的步数，例如原计划 20000 步、已完成 6000 步，则设置 `max_steps=14000`。学习率不会自动接上旧日志中的值，应根据训练阶段重新设置。
+- 默认 `save_accelerate_state=false`，不保存完整 state；旧的兼容 state 目录仍可用于完整恢复，但不会因此开启后续 state 保存。只有显式设置 `save_accelerate_state=true` 才会保存完整状态。
 - 已训练三 expert baseline `.pt` 可作为权重初始化，geometry 保持新初始化；三 expert 的 DeepSpeed state 不能用来恢复四 expert optimizer。
 - 原始随机 geometry expert 没有预训练文件；不要为让 loss 正常而关闭它。
 
@@ -704,7 +704,7 @@ RoboTwin 的基础预计算任务是 `robotwin_wan5b_dino_s_aux_mot_short_qwen3v
 | Geometry loss 持续为零 | 检查有效未来深度覆盖率、padding、mask、归一化后的有效范围；不能仅观察总 loss |
 | 训练开始很慢 | 首次模型加载、dataset stats 计算、扩展编译、缓存 I/O；先看日志和 CPU/NVMe 占用 |
 | GPU 卡住或只有部分 rank 继续 | NCCL、某 rank 数据异常、磁盘满、DeepSpeed 保存同步；保留全部 rank 的错误上下文 |
-| 磁盘突然满 | 完整 state 大小、重复下载、DINO 两阶段中间文件、每 sample geometry 小文件/inode |
+| 磁盘突然满 | 累积的权重 checkpoint、旧实验 state、启动脚本是否仍设 `save_accelerate_state=true`、重复下载、DINO 中间文件、geometry 小文件/inode |
 
 ## 14. 交付给模型负责人的结果
 
@@ -712,10 +712,10 @@ RoboTwin 的基础预计算任务是 `robotwin_wan5b_dino_s_aux_mot_short_qwen3v
 - GPU/驱动/Toolkit 记录、Python 路径、`pip-freeze.txt`、`conda-explicit.txt`、`pip check` 和 `ds_report`。
 - 源码版本/hash、服务器依赖调整 diff、下载 manifest / revision / checksum。
 - 数据集实际帧数、目录顺序、原始与解压大小、缓存 metadata、深度尺度与可视化抽查图。
-- 单卡/8 卡短跑日志、四项 loss、NCCL 结果、GPU 显存采样、首份 checkpoint/state 大小、恢复测试结果。
+- 单卡/8 卡短跑日志、四项 loss、NCCL 结果、GPU 显存采样、首份权重 checkpoint 大小、权重重新启动测试结果。
 - 正式训练的完整命令、展开配置、global batch、输出目录与 checkpoint 保留安排。
 
-做到“依赖导入通过”只能交付环境已安装；做到“所有缓存齐全”才能交付训练输入已准备；真实短跑与恢复通过后才能交付训练部署已验收。
+做到“依赖导入通过”只能交付环境已安装；做到“所有缓存齐全”才能交付训练输入已准备；真实短跑与权重重新启动通过后才能交付训练部署已验收。
 
 ## 参考与核对依据
 

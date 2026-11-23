@@ -48,7 +48,7 @@ tmux new -s train               # 重新连接用 tmux attach -t train
 | 目标 | 参数 | 说明 |
 |---|---|---|
 | 四数据集联合训练 | `task=libero_geometry_mot` | 数据配置继承 `libero_2cam.yaml`，四个 suite 拼成一个训练集，每个 epoch 均匀打乱遍历全部样本 |
-| 每 3000 步保存 | `save_every=3000` | 每次同时写权重 `checkpoints/weights/step_xxxxxx.pt` 和完整 state `checkpoints/state/step_xxxxxx/`；训练结束时还会再存一份 |
+| 每 3000 步保存 | `save_every=3000` | 每次只写权重 `checkpoints/weights/step_xxxxxx.pt`，不保存 state；训练结束时还会保存权重 |
 | loss 曲线 | `log_every=10` | 每 10 个 optimizer step 把各项 loss 写入日志，训练后用第 5 节脚本画图 |
 | 提高算力利用率 | `batch_size` 与 `gradient_accumulation_steps` | 见第 3 节，保持乘积为 16，使 8 卡 global batch = 128 |
 | 数据加载 | `num_workers`、`prefetch_factor`、`persistent_workers=true` | 避免 GPU 等数据 |
@@ -121,7 +121,7 @@ bash scripts/train_zero1.sh 8 \
   num_workers=6 prefetch_factor=4 persistent_workers=true pin_memory=true \
   num_epochs=10 max_steps=null learning_rate=1e-4 \
   log_every=10 save_every=3000 eval_every=0 \
-  save_accelerate_state=true \
+  save_accelerate_state=false \
   mixed_precision=bf16 model.mot_checkpoint_mixed_attn=true \
   resume=null wandb.enabled=false \
   2>&1 | tee "$STWAM_ROOT/logs/$RUN.log"
@@ -131,7 +131,7 @@ bash scripts/train_zero1.sh 8 \
 
 - `save_every=3000`：每 3000 个 optimizer step 保存一次。产物位于 `$STWAM_ROOT/runs/$RUN/checkpoints/`：
   - `weights/step_003000.pt`、`step_006000.pt` ……：仅权重，用于评测或作为初始化；
-  - `state/step_003000/` ……：完整 DeepSpeed/Accelerate state，用于断点续训。
+  - 不生成 `state/` 或 `trainer_state.json`；已有 state 不会自动删除。
 - `eval_every=0`：关闭训练内的视频验证，避免额外显存和耗时（日志里的 `val_loss` 本来也不是泛化指标）。
 - `num_workers=6`、`prefetch_factor=4`、`persistent_workers=true`：每个 rank 6 个 worker，共 48 个进程。服务器 CPU 核数不足（建议 ≥ 64）时降到 4；若第 7 节发现 GPU 利用率有周期性空档，再适当增大。
 - 总步数：`ceil(N/128) × num_epochs`，N 为四套数据总帧数。想缩短训练可设 `num_epochs` 或直接设 `max_steps`。
@@ -281,25 +281,25 @@ python scripts/plot_train_loss.py \
 
 ## 6. checkpoint 与磁盘
 
-每到 3000 的整数倍 step，trainer 会写两样东西（训练结束时还会额外再存一份）：
+每到 3000 的整数倍 step，trainer 只写模型权重；训练结束时也会保存。默认 `save_accelerate_state=false`，不写 optimizer、scheduler 或训练进度状态。
 
 | 路径 | 内容 | 用途 | 大小（估计，待首次保存实测） |
 |---|---|---|---|
-| `checkpoints/weights/step_003000.pt` | 仅权重 | 评测、作为初始化 | 约 15–20 GB / 份 |
-| `checkpoints/state/step_003000/` | 完整 DeepSpeed/Accelerate state（含 optimizer、scheduler、进度） | 断点续训 | 约 100–300 GB / 份 |
+| `checkpoints/weights/step_003000.pt` | 四专家及可训练 adapter / proprio 等权重 | 评测、作为新一轮训练的初始化 | 约 15–20 GB / 份 |
 
-代码**没有自动清理旧 checkpoint 的机制**。以 N≈277,713、global batch=128 估算，10 个 epoch 约 2.17 万步，会产生约 7 份 checkpoint，完整 state 合计可能达到 0.7–2 TB。请务必：
+代码**没有自动清理旧 checkpoint 的机制**。以 N≈277,713、global batch=128 估算，10 个 epoch 约 2.17 万步，按每 3000 步保存并计入结束时的保存，共约 8 份权重，约 120–160 GB，最终以实测为准。
 
-1. 第一次保存（step 3000）完成后，立即实测大小：
+1. 第一次保存（step 3000）完成后，实测大小：
 
    ```bash
-   du -sh "$STWAM_ROOT/runs/$RUN/checkpoints/weights"/* "$STWAM_ROOT/runs/$RUN/checkpoints/state"/*
+   du -sh "$STWAM_ROOT/runs/$RUN/checkpoints/weights"/*
    df -h "$STWAM_ROOT"
    ```
 
-2. 按实测大小和剩余空间制定保留策略，例如只保留最近 2 份 `state/`，`weights/` 全部保留或归档到其他盘。**删除任何 checkpoint 前先和模型负责人确认，不要写自动删除脚本。**
-3. 保存时 8 个 rank 同步写盘，期间训练会暂停数分钟，属于正常现象；磁盘写满会导致保存失败甚至任务卡死。
-4. 保存完成后，日志里会出现 `[ckpt] step=3000 weights=... state=...` 一行，以此确认保存成功。
+2. 按实测大小和剩余空间制定保留或归档策略。已有实验的 state 不会自动删除；删除任何 checkpoint 前先和模型负责人确认。
+3. 仅主 rank 写权重，其他 rank 在同步点等待；保存期间训练会暂停，实际耗时取决于磁盘和权重大小。
+4. 保存成功后，日志显示 `[ckpt] step=3000 weights=... state=None`。新输出目录下不应生成 `checkpoints/state/`。
+5. 更新源码不会改变已经运行的训练进程；下一次启动时确认没有旧的 `save_accelerate_state=true` 参数覆盖新默认值。
 
 ## 7. 监控 GPU 利用率
 
@@ -326,30 +326,36 @@ nvidia-smi --query-gpu=timestamp,index,memory.used,utilization.gpu \
 
 ## 8. 中断恢复与常见问题
 
-### 8.1 断点续训
+### 8.1 从权重重新启动训练
 
-用最近一份**完整 state** 恢复，必须保持与原训练相同的架构、8 卡、`batch_size`、`gradient_accumulation_steps`，否则 optimizer 和进度无法匹配：
+用最近一份 `weights/step_xxxxxx.pt` 初始化新训练，保留相同的模型结构、数据与缓存配置。学到的模型权重会恢复，但 optimizer、scheduler（包括 warmup）、step、epoch 和数据读取位置会重新开始。以下示例假定原计划 20000 步、已完成 6000 步，因此本次再训练 14000 步；按实际计划修改。学习率也需根据中断前日志和训练阶段重新设置。
 
 ```bash
+OLD_RUN=libero_geometry_mot_4suites_run01
+RUN=libero_geometry_mot_4suites_restart01  # 使用新的输出目录和日志
+REMAINING_STEPS=14000                   # 本次新增的 optimizer steps
+RESTART_LR=5e-5                         # 示例值，按旧日志/训练阶段调整
+
 bash scripts/train_zero1.sh 8 \
   task=libero_geometry_mot "${STWAM_COMMON[@]}" \
   "output_dir=$STWAM_ROOT/runs/$RUN" \
   batch_size=$BS gradient_accumulation_steps=$GA \
   num_workers=6 prefetch_factor=4 persistent_workers=true pin_memory=true \
-  num_epochs=10 max_steps=null learning_rate=1e-4 \
+  max_steps=$REMAINING_STEPS learning_rate=$RESTART_LR \
   log_every=10 save_every=3000 eval_every=0 \
-  save_accelerate_state=true \
+  save_accelerate_state=false \
   mixed_precision=bf16 model.mot_checkpoint_mixed_attn=true \
-  "resume=$STWAM_ROOT/runs/$RUN/checkpoints/state/step_006000" wandb.enabled=false \
-  2>&1 | tee -a "$STWAM_ROOT/logs/$RUN.log"
+  "resume=$STWAM_ROOT/runs/$OLD_RUN/checkpoints/weights/step_006000.pt" wandb.enabled=false \
+  2>&1 | tee "$STWAM_ROOT/logs/$RUN.log"
 ```
 
 要点：
 
-- 日志用 `tee -a` **追加**，不要覆盖，这样第 5 节的绘图脚本可以读到完整曲线。
-- `resume=.../state/step_xxxxxx` 会恢复 optimizer、scheduler 和训练进度；`resume=.../weights/step_xxxxxx.pt` 只加载权重，不等于续训。
-- 如果当初用 `save_accelerate_state=false` 保存，则没有可用的 state，只能用权重重新开始。
-- 续训后先确认日志中的 step 从 checkpoint 的 step 之后继续，且 loss 与中断前衔接。
+- 日志应明确显示加载了指定权重，且 optimizer / scheduler / step 未恢复；新训练从 step 0 重新计数。
+- 权重文件中记录的旧 step 不会自动计入新任务，`max_steps` 表示本次还要训练的步数。
+- 初期 loss 可能因优化器和学习率重启而波动；检查四项 loss 和梯度是否有限。
+- 新旧训练日志分别绘图，不要直接用第 5 节脚本合并相同 step 编号，否则会覆盖旧数据点。
+- 已有兼容的完整 state 仍可加载；默认关闭的是后续 state 保存，不会删除旧 state。
 
 ### 8.2 常见问题
 
@@ -361,7 +367,7 @@ bash scripts/train_zero1.sh 8 \
 | `loss_geometry` 恒为 0 | 检查 geometry 缓存的有效像素覆盖率和归一化设置，不能只看总 loss |
 | loss 出现 nan / inf | 立即停止；对比最近一份 `weights`，检查数据与学习率，保留日志，不要继续写 checkpoint |
 | 8 卡卡住、部分 rank 不动 | NCCL、磁盘写满、某 rank 数据异常；保留所有 rank 的报错信息 |
-| 磁盘写满 | 完整 state 体积大，见第 6 节；先停训练，确认保留策略后再清理 |
+| 磁盘写满 | 检查累积权重、旧 state，以及旧命令是否仍开启 state 保存；见第 6 节 |
 | 日志中没有 `[train]` 行 | 确认 `log_every` 大于 0，且训练已走过至少一个 optimizer step |
 
 ### 8.3 交付物
